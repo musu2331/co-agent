@@ -1,0 +1,12 @@
+# Use DSH's own saved official account through its documented headless overlay.
+# No credential values are stored here. DSH resolves and protects its own token.
+- id: credentials
+  disabled: false
+- id: authorization
+  disabled: false
+- id: deepseek-account
+  disabled: false
+- id: agent-default-model
+  config:
+    provider: deepseek-account
+    model: deepseek-flash

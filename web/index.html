@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="bridge-token" content="__BRIDGE_TOKEN__">
+  <meta name="color-scheme" content="light">
+  <title>项目协作台 · Pi / Codex / DSH</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar" id="sidebar">
+    <a class="brand" href="/" aria-label="项目协作台首页">
+      <span class="brand-mark"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M8 10h9a6 6 0 0 1 0 12h-2M24 22h-9a6 6 0 0 1 0-12h2"/><path d="M12 16h8"/></svg></span>
+      <span>项目协作台<small>PROJECT BRIDGE</small></span>
+    </a>
+    <div class="workspace-label">你的工作空间 <span id="project-count">—</span></div>
+    <nav id="project-nav" aria-label="项目列表"><div class="nav-loading">正在载入项目…</div></nav>
+    <button class="add-project" id="add-project"><span data-icon="plus"></span>添加项目</button>
+    <div class="sidebar-note"><span data-icon="link"></span><p>文件共享，工作接续。<small>Pi · Codex · DeepSeek Harness</small></p></div>
+    <div class="local-status"><i></i><span>本机工作空间<small>仅在这台电脑上运行</small></span><span data-icon="shield"></span></div>
+  </aside>
+  <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+  <main class="main">
+    <header class="topbar">
+      <div class="breadcrumb"><button class="icon-button mobile-menu" id="mobile-menu" aria-label="展开项目列表"><span data-icon="menu"></span></button><span class="breadcrumb-home" data-icon="grid"></span><span class="breadcrumb-workspace">工作空间</span><span class="crumb-slash">/</span><strong id="crumb">项目</strong></div>
+      <div class="topbar-actions"><button class="quiet-button" id="models-button" aria-label="模型配置"><span data-icon="sliders"></span><span>模型配置</span></button><button class="quiet-button" id="maintenance-button" aria-label="后台维护"><span data-icon="clock"></span><span>后台维护</span></button><button class="quiet-button" id="mapping-button"><span data-icon="sliders"></span><span>项目映射</span></button><span class="topbar-divider"></span><button class="health-button" id="health-button"><span class="status-dot" id="health-dot"></span><span id="health-label">正在检测工具</span><span data-icon="chevron-down"></span></button><span class="user-badge" title="本机用户">本</span></div>
+    </header>
+    <div class="content">
+      <section class="project-heading">
+        <div><div class="eyebrow"><span class="small-square"></span>共享项目</div><h1 id="project-title">工作空间</h1><p class="project-subtitle">让合适的工具，接着完成下一步。</p></div>
+        <button class="button primary new-task-trigger" id="new-task"><span data-icon="plus"></span>新建任务<span class="shortcut">Alt N</span></button>
+      </section>
+      <div class="project-location"><span data-icon="folder"></span><span id="project-path">正在载入项目路径…</span><button class="icon-button" id="copy-path" aria-label="复制项目路径" title="复制路径"><span data-icon="copy"></span></button><button class="path-open" id="open-folder">打开文件夹<span data-icon="arrow-up-right"></span></button></div>
+      <section class="tool-grid" id="tool-cards" aria-label="选择一个工具新建任务"></section>
+      <section class="sync-panel" aria-label="现有项目与会话同步"><div class="sync-heading"><strong><span data-icon="link"></span>已有项目与未归档会话</strong><button class="text-button" id="sync-sources"><span data-icon="refresh"></span>同步来源</button></div><div id="sync-status"></div><p id="sync-caption">正在读取本机工具记录…</p></section>
+      <section class="summary-strip" aria-label="项目任务概览">
+        <div><span class="summary-icon waiting" data-icon="inbox"></span><span>待处理<strong id="count-queued">0</strong></span><small>等待你的下一步</small></div>
+        <div><span class="summary-icon working" data-icon="activity"></span><span>本台执行<strong id="count-running">0</strong></span><small id="running-caption">当前没有执行中的任务</small></div>
+        <div><span class="summary-icon finished" data-icon="check-circle"></span><span>完成记录<strong id="count-done">0</strong></span><small>结果随时可以接续</small></div>
+      </section>
+      <section class="task-section">
+        <div class="section-heading"><h2>任务工作台<span id="task-total">0</span></h2><div class="live-indicator"><i></i>自动更新<button class="icon-button" id="refresh" aria-label="刷新任务"><span data-icon="refresh"></span></button></div></div>
+        <div class="task-board">
+          <div class="task-list-pane">
+            <div class="list-toolbar"><div class="filter-tabs" id="filters" role="tablist" aria-label="筛选任务"><button class="active" data-filter="all" role="tab" aria-selected="true">全部</button><button data-filter="sessions" role="tab" aria-selected="false">已有会话</button><button data-filter="queued" role="tab" aria-selected="false">待处理</button><button data-filter="running" role="tab" aria-selected="false">运行中</button><button data-filter="done" role="tab" aria-selected="false">已结束</button></div><label class="task-search"><span data-icon="search"></span><input id="task-search" placeholder="搜索任务" aria-label="搜索任务"><kbd>/</kbd></label></div>
+            <div class="task-list-label"><span>任务 / 执行工具</span><span>状态</span></div>
+            <div id="task-list" aria-live="polite"><div class="empty-list"><span data-icon="inbox"></span><h3>正在载入任务</h3><p>很快就好。</p></div></div>
+            <div class="list-footnote"><span data-icon="link"></span>项目文件共用，任务结果有迹可循。</div>
+          </div>
+          <aside class="detail-pane" id="detail-pane" aria-label="任务详情"></aside>
+        </div>
+      </section>
+      <footer class="page-footer"><span>Pi、Codex 与 DSH，共用一份项目。</span><span>PROJECT BRIDGE <i>·</i> LOCAL</span></footer>
+    </div>
+  </main>
+
+  <dialog id="compose-dialog" class="modal compose-modal">
+    <form id="compose-form">
+      <div class="modal-header"><div><div class="eyebrow">开始一项工作</div><h2>新建任务</h2></div><button type="button" class="icon-button close-dialog" aria-label="关闭新建任务"><span data-icon="x"></span></button></div>
+      <div class="modal-body">
+        <div class="form-row"><label>所属项目<select id="compose-project" required></select></label><label>任务标题 <span class="optional">可选</span><input id="compose-title" maxlength="120" placeholder="例如：复核项目改进方案"></label></div>
+        <fieldset class="tool-fieldset"><legend>交给哪个工具？</legend><div class="tool-choice-grid" id="compose-tools"></div></fieldset><div class="task-model-controls" id="compose-model-controls"></div>
+        <div class="label-row"><label for="compose-prompt">需要完成什么？</label><button type="button" class="text-button" id="import-file"><span data-icon="upload"></span>导入 Markdown / 文本</button><input type="file" id="prompt-file" accept=".md,.markdown,.txt,text/plain,text/markdown" hidden></div>
+        <textarea id="compose-prompt" rows="7" required maxlength="300000" placeholder="描述目标、需要检查或修改的内容，以及验收标准。项目已有的上下文会自动带入。"></textarea>
+        <div id="import-label" class="import-label" hidden></div>
+        <fieldset class="intent-fieldset"><legend>工作方式</legend><div class="intent-choices"><label><input type="radio" name="intent" value="review" checked><span><strong>审阅与建议</strong><small>检查、分析，先给出方案</small></span></label><label><input type="radio" name="intent" value="work"><span><strong>执行与修改</strong><small>按任务要求修改项目</small></span></label></div></fieldset>
+        <p class="form-note" id="intent-note"></p>
+        <details class="advanced-input"><summary>补充本地参考文件路径</summary><textarea id="compose-refs" rows="2" placeholder="可选，每行一个本地文件的完整路径"></textarea></details>
+        <div class="form-error" id="compose-error" role="alert" hidden></div>
+      </div>
+      <div class="modal-footer"><span>执行会使用所选工具的当前账户</span><div><button type="submit" class="button secondary" value="save">存为待办</button><button type="submit" class="button primary" value="run"><span data-icon="play"></span>创建并执行</button></div></div>
+    </form>
+  </dialog>
+
+  <dialog id="handoff-dialog" class="modal handoff-modal">
+    <form id="handoff-form"><div class="modal-header"><div><div class="eyebrow">让工作继续</div><h2>转交任务</h2></div><button type="button" class="icon-button close-dialog" aria-label="关闭转交任务"><span data-icon="x"></span></button></div><div class="modal-body"><div class="handoff-source" id="handoff-source"></div><fieldset class="tool-fieldset"><legend>下一步交给</legend><div class="tool-choice-grid" id="handoff-tools"></div></fieldset><div class="task-model-controls" id="handoff-model-controls"></div><label for="handoff-instruction">补充下一步要求</label><textarea id="handoff-instruction" rows="5" required placeholder="例如：复核上一轮结论，再给出最小修改方案，暂不实施。"></textarea><p class="form-note" id="handoff-context-note">上一轮结果会自动带入，新工具会在同一个项目目录中继续。</p><label>下一步工作方式<select id="handoff-intent"><option value="review">审阅与建议 · 先给出方案</option><option value="work">执行与修改 · 按要求修改项目</option></select></label><div class="form-error" id="handoff-error" role="alert" hidden></div></div><div class="modal-footer"><span>每个项目同时执行一项任务</span><div><button type="submit" class="button secondary" value="save">转交待办</button><button type="submit" class="button primary" value="run">转交并执行<span data-icon="arrow-right"></span></button></div></div></form>
+  </dialog>
+
+  <dialog id="resolve-dialog" class="modal handoff-modal"><form id="resolve-form"><div class="modal-header"><div><div class="eyebrow">同步工作的完成结果</div><h2>已由其他工具完成</h2></div><button type="button" class="icon-button close-dialog" aria-label="关闭关联完成结果"><span data-icon="x"></span></button></div><div class="modal-body"><label>关联已有会话<select id="resolve-session" required></select></label><label for="resolve-note">确认依据</label><textarea id="resolve-note" rows="3" maxlength="2000" required placeholder="例如：我已在 Pi 完成并验收这项工作。"></textarea><label class="resolution-check"><input type="checkbox" id="resolve-related" checked>同时处理原任务与其重试记录</label><p class="form-note">保留调用失败的原始日志。确认后显示外部完成结果，并停用重复重试。</p><div class="form-error" id="resolve-error" role="alert" hidden></div></div><div class="modal-footer"><div><button type="submit" class="button primary">关联并标记完成</button></div></div></form></dialog>
+
+  <dialog id="mapping-dialog" class="modal mapping-modal">
+    <div class="modal-header"><div><div class="eyebrow">同一份文件，三个工具</div><h2>项目映射</h2></div><button type="button" class="icon-button close-dialog" aria-label="关闭项目映射"><span data-icon="x"></span></button></div><div class="modal-body"><p class="mapping-intro">登记已有文件夹。工具切换后，项目文件和任务结果仍在原处。</p><label class="source-sync-setting"><input type="checkbox" id="auto-sync-sources">自动读取本机工具项目与会话</label><p class="form-note">关闭后仍可手动点击“同步来源”读取一次；原工具的数据保持原样。</p><div id="mapping-list"></div><form id="mapping-form"><div class="mapping-form-title"><span data-icon="folder-plus"></span><h3 id="mapping-form-title">添加项目</h3><button type="button" class="text-button" id="mapping-reset" hidden>取消编辑</button></div><div class="form-row"><label>显示名称<input id="mapping-label" placeholder="我的项目" maxlength="80" required></label><label>项目标识<input id="mapping-id" pattern="[a-zA-Z0-9][a-zA-Z0-9_-]{0,100}" placeholder="my-project" required><small>使用字母、数字、短横线</small></label></div><label>已有文件夹的完整路径<input id="mapping-path" placeholder="C:\Projects\my-project" required></label><div class="form-error" id="mapping-error" role="alert" hidden></div><div class="mapping-save-row"><span>不会复制或搬动你的文件</span><button type="submit" class="button primary" id="mapping-submit">添加项目</button></div></form></div>
+  </dialog>
+
+  <dialog id="models-dialog" class="modal models-modal"><form id="models-form"><div class="modal-header"><div><div class="eyebrow">各工具分别保存</div><h2>工作台模型配置</h2></div><button type="button" class="icon-button close-dialog" aria-label="关闭模型配置"><span data-icon="x"></span></button></div><div class="modal-body"><p class="mapping-intro">为每款工具设置默认模型，也可在新建或转交任务时单独指定。新任务会保存配置快照；正在执行的任务继续使用原设置。</p><fieldset class="tool-fieldset"><legend>选择工作台</legend><div class="tool-choice-grid" id="model-profile-tools"></div></fieldset><p class="form-note" id="model-native-note"></p><div id="model-profile-editor"></div><p class="form-note" id="models-notice"></p><div class="form-error" id="models-error" role="alert" hidden></div></div><div class="modal-footer"><span>账号由原工具管理，保存不调用模型</span><button class="button primary" id="models-save" type="submit">保存此工作台配置</button></div></form></dialog>
+
+  <dialog id="health-dialog" class="modal health-modal"><div class="modal-header"><div><div class="eyebrow">本机工具</div><h2>工具状态</h2></div><button type="button" class="icon-button close-dialog" aria-label="关闭工具状态"><span data-icon="x"></span></button></div><div class="modal-body"><div id="health-list"></div><p class="form-note">“可启动”表示命令行可用，账户和模型是否可用会在实际执行时确认。登录信息仍由各工具各自管理。</p><button class="button secondary" id="check-tools"><span data-icon="refresh"></span>重新检测</button></div></dialog>
+  <dialog id="maintenance-dialog" class="modal maintenance-modal"><div class="modal-header"><div><div class="eyebrow">独立后台维护</div><h2>废弃项目清理</h2></div><button type="button" class="icon-button close-dialog" aria-label="关闭后台维护"><span data-icon="x"></span></button></div><div class="modal-body"><div class="maintenance-policy"><strong>每周清理协作台索引与临时文件</strong><p>仅处理原工具已归档后失去来源的项目索引，或你手动标记废弃的项目。真实项目目录、任务结果和三款工具的原始会话都会保留。</p><p>临时文件保留至少 7 天；清理内容先移入本机维护回收目录，30 天后移除。维护记录单独保存在这里，不进入任务工作台。</p></div><div class="maintenance-controls"><label><input type="checkbox" id="maintenance-enabled">启用每周后台清理</label><button class="button secondary" id="maintenance-run">立即按规则清理</button></div><p id="maintenance-schedule" class="form-note"></p><div id="maintenance-error" class="form-error" role="alert" hidden></div><div class="maintenance-section-title"><h3>项目可见性</h3><label class="task-search"><span data-icon="search"></span><input id="maintenance-search" placeholder="搜索维护项目" aria-label="搜索维护项目"></label></div><p class="form-note">标记后立即从协作台隐藏；可随时恢复。待办或轮次未结束的项目会跳过。</p><div id="maintenance-projects"></div><div class="maintenance-section-title"><h3>维护记录</h3></div><div id="maintenance-history"></div></div></dialog>
+  <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+</body>
+</html>

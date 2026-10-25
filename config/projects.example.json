@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "strategy": "one physical project directory; shared task hub",
+  "projects": {}
+}

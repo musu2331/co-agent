@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "profiles": {
+    "codex": {"mode": "inherit"},
+    "pi": {"mode": "inherit"},
+    "dsh": {"mode": "inherit"}
+  }
+}
