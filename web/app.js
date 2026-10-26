@@ -1,7 +1,8 @@
 "use strict";
 
 const $ = (selector, root = document) => root.querySelector(selector);
-const token = $('meta[name="bridge-token"]').content;
+let token = $('meta[name="bridge-token"]').content;
+let tokenRefresh = null;
 const iconPaths = {
   plus: '<path d="M12 5v14M5 12h14"/>',
   x: '<path d="m6 6 12 12M18 6 6 18"/>',
@@ -72,9 +73,24 @@ const currentItems = () => [...currentTasks(), ...currentSessions().map(sessionT
 const resolved = task => task.display_status === "completed_external";
 const statusLabel = task => resolved(task) ? `已在 ${toolInfo[task.resolution.tool]?.name || task.resolution.tool} 完成` : labels[task.status] || task.status;
 
-async function api(path, body) {
-  const response = await fetch(path, { method: body === undefined ? "GET" : "POST", headers: { "X-Bridge-Token": token, ...(body === undefined ? {} : { "Content-Type": "application/json" }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+async function api(path, body, retry = true) {
+  const requestToken = token;
+  const response = await fetch(path, { method: body === undefined ? "GET" : "POST", headers: { "X-Bridge-Token": requestToken, ...(body === undefined ? {} : { "Content-Type": "application/json" }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
   const data = await response.json();
+  if (retry && response.status === 403 && data.error === "页面会话已更新，请刷新页面后重试。") {
+    if (token === requestToken) {
+      tokenRefresh ||= (async () => {
+        const page = await fetch("/", { cache: "no-store" });
+        if (!page.ok) throw new Error("无法重新连接协作台，请稍后重试。");
+        const fresh = new DOMParser().parseFromString(await page.text(), "text/html").querySelector('meta[name="bridge-token"]')?.content;
+        if (!fresh || !/^[A-Za-z0-9_-]{32,100}$/.test(fresh)) throw new Error("协作台页面令牌无效，请刷新页面。");
+        token = fresh;
+      })().finally(() => { tokenRefresh = null; });
+      await tokenRefresh;
+    }
+    // The gate rejected this request before dispatch. Retry once, never on network errors.
+    return api(path, body, false);
+  }
   if (!response.ok) throw new Error(data.error || "操作未完成，请稍后重试。");
   return data;
 }
@@ -118,9 +134,9 @@ async function refresh(force = false) {
       if (previous && active(previous.status) && terminal(task.status)) toast(task.status === "succeeded" ? `${task.title}：工具已返回结果` : `${task.title}：${labels[task.status]}`, task.status === "failed");
     }
     state.data = data;
-    if (!data.projects.some(project => project.id === state.project)) state.project = data.projects[0]?.id;
+    if (!data.projects.some(project => project.id === state.project) && !(state.project && data.syncing)) state.project = data.projects[0]?.id;
     if (!currentItems().some(task => task.id === state.selected)) state.selected = (currentProject()?.synced ? currentSessions()[0]?.key : currentTasks()[0]?.id) || currentItems()[0]?.id || null;
-    const signature = JSON.stringify({ projects: data.projects, tasks: data.tasks, tools: data.tools, sessions: data.sessions, sources: data.sources, syncing: data.syncing, checking: data.checking });
+    const signature = JSON.stringify({ projects: data.projects, tasks: data.tasks, tools: data.tools, sessions: data.sessions, sources: data.sources, syncing: data.syncing, checking: data.checking, sources_cached: data.sources_cached, workflows: data.workflows });
     if (force || signature !== state.overviewSignature) { state.overviewSignature = signature; renderOverview(); }
     await loadDetail(force);
     state.lastError = 0;
@@ -144,6 +160,9 @@ function renderOverview() {
   const data = state.data;
   const project = currentProject();
   if (!data) return;
+  const workflow = data.workflows?.[project?.id] || {};
+  $("#workflow-button").disabled = !project;
+  $("#workflow-summary").textContent = workflow.primary_tool ? `主执行：${toolInfo[workflow.primary_tool].name} · ${modelLabel(workflow.primary_model, workflow.primary_tool)}${workflow.reviewer_tool ? " · 节点审查：" + toolInfo[workflow.reviewer_tool].name : ""}` : "同一阶段持续执行，关键节点按需审查。";
   $("#project-count").textContent = data.projects.length;
   const navItem = item => el("button", { class: "project-nav-item" + (item.id === state.project ? " active" : ""), "aria-current": item.id === state.project ? "page" : "false", title: (item.synced ? toolInfo[item.source].name + " · " : "") + (item.native_path || item.windows), onClick: () => selectProject(item.id) }, item.synced ? avatar(item.source) : icon("folder"), el("span", { class: "nav-name", text: item.label }), el("span", { class: "nav-count", text: item.synced ? item.session_count : item.task_count || "" }));
   $("#project-nav").replaceChildren(el("div", { class: "nav-section-label", text: "工具中的项目 · 未归档会话" }), ...data.projects.filter(p => p.synced).map(navItem), el("div", { class: "nav-section-label", text: "已映射的文件夹" }), ...data.projects.filter(p => !p.synced).map(navItem));
@@ -151,9 +170,9 @@ function renderOverview() {
   $("#open-folder").disabled = !project;
   $("#copy-path").disabled = !project;
   if (!project) {
-    $("#crumb").textContent = "暂无可见项目";
-    $("#project-title").textContent = "暂无可见项目";
-    $("#project-path").textContent = "可在后台维护中恢复项目，或添加项目映射。";
+    $("#crumb").textContent = data.syncing ? "正在恢复上次项目" : "暂无可见项目";
+    $("#project-title").textContent = data.syncing ? "正在恢复上次项目" : "暂无可见项目";
+    $("#project-path").textContent = data.syncing ? "正在后台读取工具来源，已保存的项目可从项目列表直接选择。" : "可在后台维护中恢复项目，或添加项目映射。";
     $("#tool-cards").replaceChildren();
     for (const id of ["count-queued", "count-running", "count-done", "task-total"]) $("#" + id).textContent = "0";
     renderSync(); renderTaskList();
@@ -204,6 +223,7 @@ function renderSync() {
     return el("span", { class: "sync-source" + (health?.ok === false ? " error" : ""), title: health?.error || health?.note || (state.data.auto_sync_sources ? "正在读取来源" : "尚未读取本机来源") }, avatar(key), `${info.name} · ${health ? health.ok ? (health.visible_count ?? health.count) + " 个会话" + (health.merged_count ? `（${health.merged_count} 条调用已合并）` : "") : "读取失败" : state.data.auto_sync_sources ? "同步中" : "未读取"}`);
   }));
   $("#sync-caption").textContent = (state.data.synced_at ? "最近同步 " + formattedDate(state.data.synced_at) + " · " : "") + `${currentSessions().length} 个会话关联本项目。读取本地记录；“轮次已结束”不表示整个项目已完成。`;
+  if (state.data.sources_cached) $("#sync-caption").textContent = "已载入上次项目与会话列表；" + (state.data.syncing ? "正在后台核对最新记录。" : "点击“同步来源”核对最新记录。") + " 缓存状态不代表任务正在执行。";
   if (state.data.auto_sync_sources === false) $("#sync-caption").textContent += " 自动同步已关闭，可点击“同步来源”读取一次。";
   $("#sync-sources").disabled = state.data.syncing;
 }
@@ -211,12 +231,12 @@ function renderSync() {
 function renderSessionDetail(pane, task) {
   const source = state.detail.source_record;
   const content = el("div", { class: "detail-content" });
-  content.append(el("div", { class: "source-note" }, el("strong", { text: source.stale ? "来源读取失败，当前为上次记录" : source.state_note || "已保存的工具会话" }), el("p", { text: "查看与同步不会重新调用模型。转交会带入记录中的要求及答复，创建下一步任务。" })));
+  content.append(el("div", { class: "source-note" }, el("strong", { text: source.cached ? "已恢复列表快照，正文待来源同步完成后载入" : source.stale ? "来源读取失败，当前为上次记录" : source.state_note || "已保存的工具会话" }), el("p", { text: "查看与同步不会重新调用模型。转交会带入记录中的要求及答复，创建下一步任务。" })));
   if (state.tab === "result") content.append(state.detail.result ? markdown(state.detail.result) : el("p", { text: "来源尚无可读取的答复摘要，请在原工具中查看完整记录。" }));
   else content.append(el("p", { class: "detail-request", text: state.detail.request || "来源没有可读取的任务说明。" }));
   const tabs = el("div", { class: "detail-tabs", role: "tablist", "aria-label": "会话内容" }, [["request", "已有要求"], ["result", "最近答复"]].map(([key, title]) => el("button", { class: state.tab === key ? "active" : "", role: "tab", "aria-selected": String(state.tab === key), onClick: () => { state.tab = key; renderDetail(); } }, title)));
   const meta = el("div", { class: "session-meta" }, el("small", { text: source.association }), el("p", { text: source.canonical_path || source.cwd || "无目录" }), el("small", { text: "原会话 ID：" + source.id }));
-  pane.replaceChildren(el("div", { class: "detail-top" }, avatar(task.tool), toolInfo[task.tool].name, statusPill(task)), el("h3", { class: "detail-title", text: task.title }), el("div", { class: "detail-time", text: "已有会话 · " + formattedDate(task.created_at, true) }), el("div", { class: "detail-actions" }, el("button", { class: "button primary", onClick: openHandoff }, icon("arrow-right"), "带上下文转交"), el("button", { class: "button secondary", onClick: () => copy(source.record_path, "原记录路径已复制") }, icon("copy"), "复制来源路径")), tabs, content, meta);
+  pane.replaceChildren(el("div", { class: "detail-top" }, avatar(task.tool), toolInfo[task.tool].name, statusPill(task)), el("h3", { class: "detail-title", text: task.title }), el("div", { class: "detail-time", text: "已有会话 · " + formattedDate(task.created_at, true) }), el("div", { class: "detail-actions" }, el("button", { class: "button primary", disabled: Boolean(source.cached), onClick: openHandoff }, icon("arrow-right"), source.cached ? "等待来源同步" : "带上下文转交"), el("button", { class: "button secondary", onClick: () => copy(source.record_path, "原记录路径已复制") }, icon("copy"), "复制来源路径")), tabs, content, meta);
 }
 
 function openResolve() {
@@ -298,6 +318,12 @@ function renderDetail() {
     if (task.refs?.length) content.append(el("div", { class: "references" }, "参考文件", task.refs.map(ref => el("div", { class: "reference-line", title: ref }, icon("document"), el("span", { text: ref.split(/[\\/]/).pop() }), el("button", { class: "icon-button", "aria-label": "复制参考路径", onClick: () => copy(ref) }, icon("copy"))))));
   } else if (state.tab === "result") {
     content.append((state.detail.external_result || state.detail.result) ? markdown(state.detail.external_result || state.detail.result) : el("div", { class: "detail-empty" }, icon("document"), el("h3", { text: "还没有调用结果" }), el("p", { text: task.status === "queued" ? "开始执行后，工具的最终答复会保存在这里。" : active(task.status) ? "执行中的输出可以在「日志」中查看。" : "工具尚未给出结果，可查看日志定位原因。" })));
+  } else if (state.tab === "handoff") {
+    const report = state.detail.handoff_card || {};
+    content.append(el("p", { class: "form-note", text: "由原始报告生成的交接草稿，内容尚未独立核实；授权与验收标准沿用阶段快照。可在转交窗口补充。" }));
+    for (const [key, label] of Object.entries(cardLabels)) content.append(el("h3", { text: label }), el("p", { class: "detail-request", text: report[key] || "尚未填写" }));
+    content.append(el("h3", { text: "阻塞分类" }), el("p", { text: state.data.blocker_categories?.[report.blocker] || "无阻塞" }));
+    if (task.handoff_input) content.append(el("details", {}, el("summary", { text: "本任务接收的交接卡快照" }), el("pre", { class: "log-output", text: JSON.stringify(task.handoff_input, null, 2) })));
   } else {
     if (state.detail.stdout) content.append(el("div", { class: "log-title", text: "任务输出" }), el("pre", { class: "log-output", text: state.detail.stdout }));
     if (state.detail.stderr) content.append(el("div", { class: "log-title", text: "运行诊断" }), el("pre", { class: "log-output", text: state.detail.stderr }));
@@ -317,7 +343,7 @@ function renderDetail() {
   else minor.append(el("span"));
   if (state.detail.external_result || state.detail.result) minor.append(el("div", {}, el("button", { class: "text-button", onClick: () => copy(state.detail.external_result || state.detail.result, "结果已复制") }, icon("copy"), "复制结果"), "　", el("button", { class: "text-button", onClick: () => downloadResult(task) }, icon("download"), "下载 Markdown")));
   const meta = el("details", { class: "detail-meta" }, el("summary", { text: "任务信息" }), el("dl", {}, el("dt", { text: "任务编号" }), el("dd", { text: task.id }), el("dt", { text: "执行目录" }), el("dd", { text: currentProject()?.windows }), el("dt", { text: "交接来源" }), el("dd", { text: task.parent || (task.origin === "webui" ? "在界面中创建" : task.origin) })));
-  pane.replaceChildren(el("div", { class: "detail-top" }, avatar(task.tool), toolInfo[task.tool].name, statusPill(task)), el("h3", { class: "detail-title", text: task.title }), el("div", { class: "detail-time" }, icon("clock"), formattedDate(task.created_at, true), "·", task.intent === "review" ? "审阅与建议" : "执行与修改"), el("p", { class: "form-note", text: "模型配置快照：" + (task.model_label || modelLabel(task.model_config, task.tool)) }), actions, el("div", { class: "detail-tabs", role: "tablist", "aria-label": "任务内容" }, [["request", "任务说明"], ["result", "运行结果"], ["logs", "日志"]].map(([key, label]) => el("button", { class: state.tab === key ? "active" : "", role: "tab", "aria-selected": String(state.tab === key), onClick: () => { state.tab = key; renderDetail(); } }, label))), content, minor, meta);
+  pane.replaceChildren(el("div", { class: "detail-top" }, avatar(task.tool), toolInfo[task.tool].name, statusPill(task)), el("h3", { class: "detail-title", text: task.title }), el("div", { class: "detail-time" }, icon("clock"), formattedDate(task.created_at, true), "·", task.intent === "review" ? "审阅与建议" : "执行与修改"), el("p", { class: "form-note", text: "模型配置快照：" + (task.model_label || modelLabel(task.model_config, task.tool)) + (task.handoff_mode === "review" ? " · 关键节点审查" : "") }), actions, el("div", { class: "detail-tabs", role: "tablist", "aria-label": "任务内容" }, [["request", "任务说明"], ["result", "运行结果"], ["handoff", "交接卡"], ["logs", "日志"]].map(([key, label]) => el("button", { class: state.tab === key ? "active" : "", role: "tab", "aria-selected": String(state.tab === key), onClick: () => { state.tab = key; renderDetail(); } }, label))), content, minor, meta);
   content.scrollTop = state.tab === "logs" && follow ? content.scrollHeight : scrollTop;
 }
 
@@ -356,8 +382,11 @@ function modelLabel(value, tool) {
 }
 function renderModelEditor(container, prefix, tool, selection, task = false) {
   const field = name => `${prefix}-model-${name}`;
+  const projectId = prefix === "compose" ? $("#compose-project")?.value || state.project : state.project;
+  const workflow = state.data.workflows?.[projectId];
+  const defaultModel = workflow?.primary_tool === tool ? workflow.primary_model : state.data.model_profiles?.[tool];
   const mode = el("select", { id: field("mode"), "aria-label": task ? "本次模型设置" : "默认模型模式" },
-    ...(task ? [el("option", { value: "default", text: "工作台默认：" + modelLabel(state.data.model_profiles?.[tool], tool) })] : []),
+    ...(task ? [el("option", { value: "default", text: (workflow?.primary_tool === tool ? "项目主执行模型：" : "工作台默认：") + modelLabel(defaultModel, tool) })] : []),
     el("option", { value: "inherit", text: tool === "dsh" ? "官方账号默认模型" : "跟随工具默认" }), el("option", { value: "override", text: "指定模型" }));
   const model = el("input", { id: field("id"), maxlength: "160", placeholder: "填写模型 ID，或选择本机候选", list: field("choices"), autocomplete: "off", value: selection?.model || "" });
   const provider = el("input", { id: field("provider"), maxlength: "160", placeholder: "留空由 Pi 解析提供方", value: selection?.provider || "" });
@@ -384,6 +413,47 @@ function readModelEditor(prefix) {
   if (mode === "inherit") return { mode };
   return { mode, model: get("id"), provider: get("provider"), reasoning: get("reasoning") };
 }
+const cardLabels = { goal: "阶段目标", completed: "已完成", changes: "变更文件", evidence: "验证证据", pending: "未完成", scope: "授权范围与边界", acceptance: "统一验收标准", next_step: "建议下一步", blocker_detail: "阻塞事实与待补充条件" };
+const editableCardFields = ["completed", "changes", "evidence", "pending", "next_step", "blocker_detail"];
+function renderCardEditor(report) {
+  const fields = editableCardFields.map(key => el("label", {}, cardLabels[key], el("textarea", { id: "card-" + key, rows: key === "evidence" ? "4" : "3", maxlength: "8000", text: report[key] || "" })));
+  const select = el("select", { id: "card-blocker" }, ...Object.entries(state.data.blocker_categories || {none: "无阻塞"}).map(([value, label]) => el("option", { value, text: label })));
+  select.value = report.blocker || "none";
+  const note = el("p", { class: "form-note" });
+  const update = () => {
+    note.textContent = { none: "没有阻塞时，可继续明确的未完成项。", permission: "记录失败的操作、运行身份与原始报错；区分实际权限不足和未经验证的推测。", authorization: "列出需要授权的具体动作和范围，等待用户处理。", missing_info: "列出缺少的文件、参数或验收信息。", tool_failure: "填写错误码、日志位置及已尝试的诊断。", policy: "记录当前工具明确返回的限制及允许的替代方案；分类不会触发自动切换。", other: "描述可复现的事实及下一步需要核实的条件。" }[select.value];
+    $("#card-blocker_detail").required = select.value !== "none";
+  };
+  $("#handoff-card-fields").replaceChildren(el("label", {}, "阻塞分类", select), note, ...fields);
+  select.addEventListener("change", update); update();
+}
+function readCardEditor() { return Object.fromEntries([...editableCardFields.map(key => [key, $("#card-" + key).value]), ["blocker", $("#card-blocker").value]]); }
+function renderWorkflowModel() {
+  const tool = $("#workflow-primary").value;
+  $("#workflow-model-controls").hidden = !tool;
+  renderModelEditor($("#workflow-model-controls"), "workflow", tool || "pi", tool === state.workflowDraft?.primary_tool ? state.workflowDraft.primary_model : {mode: "inherit"});
+}
+$("#workflow-button").addEventListener("click", async () => {
+  if (!currentProject()) return;
+  state.workflowProject = state.project;
+  state.workflowDraft = state.data.workflows?.[state.project] || {};
+  if (!state.models) { try { state.models = await api("/api/models"); } catch {} }
+  $("#workflow-project-note").textContent = currentProject().label + " · 新阶段的默认执行者与共同验收标准";
+  $("#workflow-primary").value = state.workflowDraft.primary_tool || "";
+  $("#workflow-reviewer").value = state.workflowDraft.reviewer_tool || "";
+  $("#workflow-scope").value = state.workflowDraft.scope || "";
+  $("#workflow-acceptance").value = state.workflowDraft.acceptance || "";
+  modalError("#workflow-error"); renderWorkflowModel(); showDialog("#workflow-dialog");
+});
+$("#workflow-primary").addEventListener("change", renderWorkflowModel);
+$("#workflow-form").addEventListener("submit", async event => {
+  event.preventDefault(); const button = $('button[type="submit"]', event.target); button.disabled = true;
+  try {
+    await api(`/api/workflows/${state.workflowProject}`, { primary_tool: $("#workflow-primary").value, reviewer_tool: $("#workflow-reviewer").value, primary_model: $("#workflow-primary").value ? readModelEditor("workflow") : {mode: "inherit"}, scope: $("#workflow-scope").value, acceptance: $("#workflow-acceptance").value });
+    $("#workflow-dialog").close(); await refresh(true); toast("项目协作流程已保存，新阶段生效");
+  } catch (error) { modalError("#workflow-error", error.message); }
+  finally { button.disabled = false; }
+});
 function renderTaskModel(prefix, tool) { renderModelEditor($(`#${prefix}-model-controls`), prefix, tool, null, true); }
 function renderModelProfile(tool) {
   state.modelTool = tool;
@@ -403,8 +473,9 @@ $("#models-form").addEventListener("submit", async event => {
   catch (error) { modalError("#models-error", error.message); }
   finally { $("#models-save").disabled = false; }
 });
-async function openCompose(tool = state.tool) {
+async function openCompose(tool) {
   if (!state.data) return;
+  tool ||= state.data.workflows?.[state.project]?.primary_tool || state.tool;
   if (!state.models) { try { state.models = await api("/api/models"); } catch (error) { toast("候选读取失败，可手动填写模型 ID", true); } }
   $("#compose-form").reset(); state.tool = tool; $("#import-label").hidden = true; modalError("#compose-error");
   $("#compose-project").replaceChildren(...state.data.projects.map(project => el("option", { value: project.id, ...(project.id === state.project ? { selected: "selected" } : {}) }, project.label)));
@@ -448,27 +519,44 @@ $("#prompt-file").addEventListener("change", async event => {
   event.target.value = "";
 });
 document.querySelectorAll('input[name="intent"]').forEach(input => input.addEventListener("change", intentNote));
+$("#compose-project").addEventListener("change", () => {
+  state.tool = state.data.workflows?.[$("#compose-project").value]?.primary_tool || state.tool;
+  choices($("#compose-tools"), "compose-tool", state.tool, value => { state.tool = value; renderTaskModel("compose", value); intentNote(); });
+  renderTaskModel("compose", state.tool); intentNote();
+});
 
 async function openHandoff() {
   if (!state.detail || (!state.detail.task.external && !terminal(state.detail.task.status) && !resolved(state.detail.task))) return;
   if (!state.models) { try { state.models = await api("/api/models"); } catch (error) { toast("候选读取失败，可手动填写模型 ID", true); } }
   const task = state.detail.task;
   state.handoffSource = state.detail;
-  state.handoffTool = task.tool === "codex" ? "pi" : "codex";
+  state.handoffStage = state.detail.handoff_stage || task.contract || { goal: state.detail.request?.slice(0, 8000), scope: "", acceptance: "", executor_tool: task.tool, executor_model: task.model_config || {mode: "inherit"}, executor_intent: task.external ? "review" : task.intent };
+  $("#handoff-mode").value = "continue";
+  renderCardEditor(state.detail.handoff_card || {});
   $("#handoff-source").replaceChildren(el("small", { text: "上一轮 · " + toolInfo[task.tool].name }), el("strong", { text: task.title }));
-  choices($("#handoff-tools"), "handoff-tool", state.handoffTool, value => { state.handoffTool = value; renderTaskModel("handoff", value); handoffAvailability(); });
-  renderTaskModel("handoff", state.handoffTool);
-  $("#handoff-context-note").textContent = task.external ? "带入最近保存的要求与答复，创建新的接续任务；原会话保持原样。" : "上一轮结果会自动带入，新工具会在同一个项目目录中继续。";
-  $("#handoff-instruction").value = "复核上一轮结论与项目文件是否一致，给出下一步最小方案，暂不实施。";
-  $("#handoff-intent").value = "review";
+  configureHandoffMode();
   modalError("#handoff-error"); handoffAvailability(); showDialog("#handoff-dialog");
 }
+function configureHandoffMode() {
+  const mode = $("#handoff-mode").value, stage = state.handoffStage, task = state.handoffSource.task;
+  state.handoffTool = mode === "review" ? stage.reviewer_tool || state.data.workflows?.[state.project]?.reviewer_tool || (stage.executor_tool === "codex" ? "pi" : "codex") : stage.executor_tool;
+  choices($("#handoff-tools"), "handoff-tool", state.handoffTool, value => { state.handoffTool = value; renderTaskModel("handoff", value); handoffAvailability(); });
+  if (mode === "continue") $("#handoff-tools").querySelectorAll("input").forEach(input => { input.disabled = true; });
+  $("#handoff-model-controls").hidden = mode === "continue";
+  renderTaskModel("handoff", state.handoffTool);
+  $("#handoff-intent").value = mode === "review" ? "review" : stage.executor_intent || "work";
+  $("#handoff-intent").disabled = mode !== "switch";
+  $("#handoff-instruction").value = mode === "review" ? "审查上一轮变更及其验收证据，列出关键问题和最小修复建议，暂不实施。" : state.detail.handoff_card?.next_step || "按交接卡继续未完成项，沿用本阶段目标、验收标准和授权范围；检查新增或有矛盾的证据。";
+  $("#handoff-contract").replaceChildren(el("strong", { text: task.external ? "首次接入原工具会话，将创建新阶段。" : `阶段主执行：${toolInfo[stage.executor_tool].name} · ${modelLabel(stage.executor_model, stage.executor_tool)}` }), ...["goal", "acceptance", "scope"].map(key => el("p", { text: `${cardLabels[key]}：${stage[key] || "未单独填写，遵循原任务与项目约束"}` })));
+  handoffAvailability();
+}
+$("#handoff-mode").addEventListener("change", configureHandoffMode);
 function handoffAvailability() {
   const issue = state.data.tools[state.handoffTool]?.execution_error;
-  const unfinished = state.handoffSource?.task.external && state.handoffSource.source_record.state === "turn_open";
+  const unfinished = state.handoffSource?.task.external && (state.handoffSource.source_record.state === "turn_open" || state.handoffSource.source_record.stale);
   const blocked = Boolean(issue || unfinished);
   $('button[value="run"]', $("#handoff-form")).disabled = blocked;
-  $("#handoff-context-note").textContent = issue || (unfinished ? "原会话保存的轮次尚未结束。现在可转交为待办，请先核对原工具，再执行下一步。" : state.handoffSource?.task.external ? "带入最近保存的要求与答复，创建新的接续任务；原会话保持原样。" : "上一轮结果会自动带入，新工具会在同一个项目目录中继续。");
+  $("#handoff-context-note").textContent = issue || (unfinished ? "原会话保存的轮次尚未结束。现在可转交为待办，请先核对原工具，再执行下一步。" : state.handoffSource?.task.external ? "带入最近保存的要求与答复，创建新阶段；原会话保持原样。" : $("#handoff-mode").value === "review" ? "只审查选定节点；审查结束后，选择继续阶段即可回到原执行工具和模型。" : "带入交接卡与原始报告，沿用阶段目标、验收标准和授权范围。");
 }
 $("#handoff-form").addEventListener("submit", async event => {
   event.preventDefault(); const buttons = $("#handoff-form").querySelectorAll('button[type="submit"]'); buttons.forEach(button => button.disabled = true);
@@ -476,7 +564,7 @@ $("#handoff-form").addEventListener("submit", async event => {
     const run = event.submitter?.value === "run";
     const source = state.handoffSource;
     const external = source.task.external;
-    const result = await api(`/api/${external ? "sessions" : "tasks"}/${source.task.id}/handoff`, { tool: state.handoffTool, instruction: $("#handoff-instruction").value, intent: $("#handoff-intent").value, project: external ? source.source_record.mapped_project || source.source_record.project : undefined, model_config: readModelEditor("handoff"), run });
+    const result = await api(`/api/${external ? "sessions" : "tasks"}/${source.task.id}/handoff`, { tool: state.handoffTool, instruction: $("#handoff-instruction").value, intent: $("#handoff-intent").value, handoff_mode: $("#handoff-mode").value, handoff_card: readCardEditor(), project: external ? source.source_record.mapped_project || source.source_record.project : undefined, model_config: $("#handoff-mode").value === "continue" ? null : readModelEditor("handoff"), run });
     state.project = result.task.project; localStorage.setItem("bridge.project", state.project); state.selected = result.task.id; state.filter = "all"; state.tab = run && !result.notice ? "logs" : "request"; $("#handoff-dialog").close(); toast(result.notice || (run ? "已转交并开始执行" : "已转交为新的待办任务"), Boolean(result.notice)); await refresh(true);
   } catch (error) { modalError("#handoff-error", error.message); }
   finally { buttons.forEach(button => button.disabled = false); }

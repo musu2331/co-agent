@@ -73,6 +73,43 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(result["status"], "succeeded")
         self.assertTrue((self.instance.folder(task["id"]) / "result.md").is_file())
 
+    def test_codex_desktop_detection_without_path_recovers_after_update(self):
+        local = self.base / "local"
+        old = local / "OpenAI/Codex/bin/old/codex.exe"
+        new = local / "OpenAI/Codex/bin/new/codex.exe"
+        old.parent.mkdir(parents=True)
+        old.touch()
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(local), "CODEX_CLI_PATH": str(old)}, clear=True), patch.object(bridge.shutil, "which", return_value=None):
+            self.assertEqual(bridge.windows_codex_engine().command, [str(old)])
+            old.unlink()  # Explorer still has the removed version's environment.
+            new.parent.mkdir(parents=True)
+            new.touch()
+            self.assertEqual(bridge.windows_codex_engine().command, [str(new)])
+
+    def test_codex_known_installer_and_npm_locations_without_path(self):
+        local = self.base / "local"
+        direct = local / "Programs/OpenAI/Codex/bin/codex.exe"
+        direct.parent.mkdir(parents=True)
+        direct.touch()
+        appdata, programfiles = self.base / "roaming", self.base / "programs"
+        entry = appdata / "npm/node_modules/@openai/codex/bin/codex.js"
+        node = programfiles / "nodejs/node.exe"
+        entry.parent.mkdir(parents=True)
+        node.parent.mkdir(parents=True)
+        entry.touch()
+        node.touch()
+        with patch.dict(os.environ, {"LOCALAPPDATA": str(local), "APPDATA": str(appdata), "ProgramFiles": str(programfiles)}, clear=True), patch.object(bridge.shutil, "which", return_value=None):
+            self.assertEqual(bridge.windows_codex_engine().command, [str(direct)])
+            direct.unlink()
+            self.assertEqual(bridge.windows_codex_engine().command, [str(node), str(entry)])
+
+    def test_codex_discovery_does_not_report_denied_executable_as_missing(self):
+        explicit = self.base / "codex.exe"
+        explicit.touch()
+        with patch.dict(os.environ, {"CODEX_CLI_PATH": str(explicit)}, clear=True), patch.object(bridge.shutil, "which", return_value=None), patch.object(bridge, "installed_file", side_effect=bridge.BridgeError("Access denied while locating an installed tool")):
+            with self.assertRaisesRegex(bridge.BridgeError, "Access denied"):
+                bridge.windows_codex_engine()
+
     def test_dsh_stdin_headless_adapter(self):
         task = self.task("dsh")
         result = self.run_task(task)

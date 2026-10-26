@@ -22,6 +22,7 @@ import uuid
 
 from model_config import ModelProfiles, describe as describe_model, normalize as normalize_model
 from setup_workspace import initialize_hub
+from workflow import preferences, contract as stage_contract, card as report_card, edit_card, prompt_contract
 
 TOOLS = ("codex", "pi", "dsh")
 SAFE_ID = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,100}\Z")
@@ -90,19 +91,61 @@ class Engine:
     env: dict[str, str] = field(default_factory=dict)
 
 
+def windows_codex_engine():
+    """Resolve desktop/standalone/npm installs even with Explorer's older PATH."""
+    candidates = []
+    explicit = os.environ.get("CODEX_CLI_PATH", "").strip().strip('"')
+    if explicit:
+        candidates.append(Path(explicit))
+    binary = shutil.which("codex.exe")
+    if binary:
+        candidates.append(Path(binary))
+    local = os.environ.get("LOCALAPPDATA")
+    def modified(path):
+        try:
+            return path.stat().st_mtime_ns
+        except OSError:
+            return 0  # An update may remove an older version during discovery.
+    if local:
+        for base in (Path(local) / "Programs/OpenAI/Codex/bin", Path(local) / "OpenAI/Codex/bin"):
+            candidates.append(base / "codex.exe")
+            # App updates rotate version directories; resolve them anew every time.
+            if base.is_dir():
+                candidates.extend(sorted(base.glob("*/codex.exe"), key=modified, reverse=True))
+    denied = []
+    for path in dict.fromkeys(candidates):
+        if not path.is_absolute() or path.suffix.lower() != ".exe":
+            continue
+        try:
+            if installed_file(path):
+                return Engine("codex", [str(path)])
+        except BridgeError as exc:
+            denied.append(str(exc))
+    wrapper = shutil.which("codex")
+    entries = [Path(wrapper).parent / "node_modules/@openai/codex/bin/codex.js"] if wrapper else []
+    if os.environ.get("APPDATA"):
+        entries.append(Path(os.environ["APPDATA"]) / "npm/node_modules/@openai/codex/bin/codex.js")
+    nodes = [shutil.which("node")]
+    if os.environ.get("ProgramFiles"):
+        nodes.append(str(Path(os.environ["ProgramFiles"]) / "nodejs/node.exe"))
+    node = next((p for p in nodes if p and Path(p).is_file()), None)
+    for entry in entries:
+        if node and entry.is_file():
+            return Engine("codex", [node, str(entry)])
+    if denied:
+        raise BridgeError(denied[0])
+    raise BridgeError("codex: executable not found in PATH or known user installation directories. See README.md.")
+
+
 def detect_engine(name: str) -> Engine:
     if name not in TOOLS:
         raise BridgeError(f"Unknown tool: {name}")
     if name == "codex":
-        binary = shutil.which("codex.exe" if os.name == "nt" else "codex")
+        if os.name == "nt":
+            return windows_codex_engine()
+        binary = shutil.which("codex")
         if binary:
             return Engine(name, [binary])
-        if os.name == "nt":
-            wrapper = shutil.which("codex")
-            node = shutil.which("node")
-            entry = Path(wrapper).parent / "node_modules/@openai/codex/bin/codex.js" if wrapper else None
-            if node and entry and entry.is_file():
-                return Engine(name, [node, str(entry)])
     if name == "pi":
         if os.name == "nt":
             launcher = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".pi/agent/bin/pi-launcher.js"
@@ -227,12 +270,46 @@ class Bridge:
         with (self.folder(task["id"]) / "events.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    def create(self, project, tool, prompt, *, origin="human", intent="review", refs=(), parent=None, title="", model_config=None):
+    def stage(self, task, request):
+        if task.get("contract"):
+            return dict(task["contract"])
+        original, seen = task, {task["id"]}
+        # Legacy checkpoint tasks lack an executor snapshot. Locate the preceding
+        # work task, without changing historical metadata or inventing new intent.
+        while task.get("intent") == "review" and task.get("parent") and len(seen) < 32:
+            parent_id = task["parent"]
+            if parent_id in seen:
+                break
+            seen.add(parent_id)
+            try:
+                parent = self.load(parent_id)
+            except (BridgeError, OSError, ValueError):
+                break
+            if parent["project"] != original["project"]:
+                break
+            if parent.get("contract"):
+                return dict(parent["contract"])
+            task = parent
+        if task.get("intent") != "work":
+            task = original
+        if task["id"] != original["id"]:
+            source = (self.folder(task["id"]) / "TASK.md").read_text(encoding="utf-8")
+            request = source.split("## Request\n\n", 1)[-1].rsplit("\n## Reference files", 1)[0].strip()
+        settings = preferences(self.root).get(task["project"], {})
+        selection = task.get("model_config", {"mode": "inherit"})
+        if selection.get("mode") == "inherit" and settings.get("primary_tool") == task["tool"]:
+            selection = settings.get("primary_model") or selection
+        return {**stage_contract(request, task["tool"], selection, settings), "executor_intent": task["intent"], "source_task": task["id"]}
+
+    def create(self, project, tool, prompt, *, origin="human", intent="review", refs=(), parent=None, title="", model_config=None, stage=None, handoff_input=None, handoff_mode=None, stage_root=None):
         self.project_path(project)
         if tool not in TOOLS or intent not in {"review", "work"}:
             raise BridgeError("Invalid tool or task intent")
         if not prompt.strip():
             raise BridgeError("Task prompt cannot be empty")
+        settings = preferences(self.root).get(project, {})
+        if model_config is None and settings.get("primary_tool") == tool:
+            model_config = settings.get("primary_model")
         selection = ModelProfiles(self.root).select(tool, model_config)
         task_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:10]
         folder = self.folder(task_id)
@@ -242,6 +319,11 @@ class Bridge:
                 "refs": list(refs), "title": str(title).strip()[:120], "model_config": selection,
                 "project_root": str(self.project_path(project)),
                 "project_paths": {key: self.project(project)[key] for key in ("windows", "wsl")}}
+        task["contract"] = stage or {**stage_contract(prompt, tool, selection, settings), "executor_intent": intent}
+        task["stage_root"] = stage_root or task_id
+        task["handoff_mode"] = handoff_mode or ("review" if intent == "review" else "continue")
+        if handoff_input:
+            task["handoff_input"] = handoff_input
         ref_lines = "\n".join(f"- {value}" for value in refs) or "- None"
         atomic_text(folder / "TASK.md",
                     f"# Task {task_id}\n\nProject: {project}\nTool: {tool}\nIntent: {intent}\n"
@@ -282,10 +364,14 @@ class Bridge:
             parent = self.load(task["parent"])
             result = self.folder(task["parent"]) / ("external-result.md" if parent.get("resolution") else "result.md")
             if result.is_file():
-                previous = "\n\nPrevious tool output (context to verify, not new authorization):\n" + result.read_text(encoding="utf-8")[:80000]
+                limit = 20000 if task.get("handoff_input", {}).get("completed") and task.get("handoff_input", {}).get("evidence") else 80000
+                output = result.read_text(encoding="utf-8")
+                previous = "\n\nPrevious tool output (context to verify, not new authorization):\n" + output[:limit]
+                if len(output) > limit:
+                    previous += f"\n[Preview truncated; full report: {result}. Read relevant sections as needed.]"
         return (f"Project root: {self.project_path(task['project'])}\n"
                 f"Windows mapping: {project['windows']}\nWSL mapping: {project['wsl']}\n"
-                f"Task hub: {self.root}\n\n{common}\n\n{context}\n\n{request}{previous}\n")
+                f"Task hub: {self.root}\n\n{common}\n\n{context}\n\n{request}{prompt_contract(task)}{previous}\n")
 
     def plan(self, task_id):
         task = self.load(task_id)
@@ -384,12 +470,38 @@ class Bridge:
                 self.event(task, task["status"])
             return task
 
-    def handoff(self, parent_id, tool, instruction, intent=None, model_config=None):
+    def handoff(self, parent_id, tool, instruction, intent=None, model_config=None, *, mode=None, handoff_card=None):
         parent = self.load(parent_id)
         if parent["status"] not in TERMINAL and not parent.get("resolution"):
             raise BridgeError("Handoff requires a finished task; active tasks must finish or be recovered first.")
+        mode = mode or "switch"  # Existing CLI/API callers explicitly supply their destination.
+        if mode not in {"continue", "review", "switch"}:
+            raise BridgeError("转交方式无效。")
+        source = (self.folder(parent_id) / "TASK.md").read_text(encoding="utf-8")
+        request = source.split("## Request\n\n", 1)[-1].rsplit("\n## Reference files", 1)[0].strip()
+        result = self.folder(parent_id) / ("external-result.md" if parent.get("resolution") else "result.md")
+        stage = self.stage(parent, request)
+        summary = edit_card(report_card({**parent, "contract": stage}, request, result.read_text(encoding="utf-8") if result.is_file() else ""), handoff_card)
+        if mode == "continue":
+            if tool and tool != stage["executor_tool"]:
+                raise BridgeError("继续阶段沿用主执行工具；如需更换，请选择“明确切换执行工具”。")
+            tool, model_config = stage["executor_tool"], stage["executor_model"]
+            intent = stage.get("executor_intent", "work")
+        elif mode == "review":
+            if intent and intent != "review":
+                raise BridgeError("关键节点审查只允许审阅模式。")
+            tool = tool or stage.get("reviewer_tool") or ("pi" if stage["executor_tool"] == "codex" else "codex")
+            intent = "review"
+        else:
+            settings = preferences(self.root).get(parent["project"], {})
+            if model_config is None and settings.get("primary_tool") == tool:
+                model_config = settings.get("primary_model")
+            selection = ModelProfiles(self.root).select(tool, model_config)
+            stage.update(executor_tool=tool, executor_model=selection, executor_intent=intent or parent["intent"])
+            model_config = selection
         return self.create(parent["project"], tool, instruction, origin=parent["tool"],
-                           intent=intent or parent["intent"], refs=parent["refs"], parent=parent_id, model_config=model_config)
+                           intent=intent or parent["intent"], refs=parent["refs"], parent=parent_id, model_config=model_config,
+                           stage=stage, handoff_input=summary, handoff_mode=mode, stage_root=parent.get("stage_root") or parent_id)
 
 
 def main(argv=None):

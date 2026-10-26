@@ -10,12 +10,12 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parent
 FILES = (
-    "bridge.py", "webui.py", "model_config.py", "sources.py", "maintenance.py", "export_release.py",
-    "COMMON.md", "dsh-account.patch.yml", "REPLICATE.md", "README.md", ".gitignore", ".gitattributes", "bridge.cmd", "open-webui.cmd",
+    "bridge.py", "webui.py", "model_config.py", "workflow.py", "sources.py", "maintenance.py", "export_release.py",
+    "COMMON.md", "WORKFLOW.md", "dsh-account.patch.yml", "REPLICATE.md", "README.md", ".gitignore", ".gitattributes", "bridge.cmd", "open-webui.cmd",
     "setup_workspace.py", "config/projects.example.json", "config/model-config.example.json", "config/app-settings.example.json",
     "launch-webui.vbs", "打开项目协作台.vbs", "web/index.html", "web/style.css", "web/app.js", "web/favicon.svg",
     "tests/test_bridge.py", "tests/test_webui.py", "tests/test_sources.py", "tests/test_maintenance.py",
-    "tests/test_model_config.py", "tests/test_export_release.py", "tests/test_setup_workspace.py",
+    "tests/test_model_config.py", "tests/test_workflow.py", "tests/test_export_release.py", "tests/test_setup_workspace.py",
 )
 
 

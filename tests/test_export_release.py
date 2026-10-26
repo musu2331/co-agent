@@ -23,7 +23,7 @@ class ExportReleaseTests(unittest.TestCase):
             path = self.source / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / relative, path)
-        for relative in ("tasks/private/task.json", "state/dsh-account-check.json", "state/maintenance.json", "contexts/private.md", "projects.json", "model-config.json", "screenshot.jpg", ".credentials.yaml"):
+        for relative in ("tasks/private/task.json", "state/dsh-account-check.json", "state/maintenance.json", "state/workflows.json", "state/path-aliases.json", "contexts/private.md", "projects.json", "model-config.json", "screenshot.jpg", ".credentials.yaml"):
             path = self.source / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("PRIVATE_FIXTURE_NEVER_EXPORT", encoding="utf-8")

@@ -2,6 +2,7 @@ import hashlib
 from contextlib import closing
 import json
 from pathlib import Path
+from unittest.mock import patch
 import sqlite3
 import sys
 import tempfile
@@ -17,7 +18,7 @@ class SourceTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="bridge-sources-")
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
-        self.project = self.home / "DeskBox/workspace/demo"
+        self.project = self.home / "Projects/demo"
         self.project.mkdir(parents=True)
         self.config = {"demo": {"windows": str(self.project), "wsl": str(self.project), "label": "demo"}}
         self.pi = self.home / ".pi/agent/sessions/root/session.jsonl"
@@ -45,6 +46,7 @@ class SourceTests(unittest.TestCase):
         # These files must never be read or copied by the adapters.
         for file in [self.home / ".pi/agent/auth.json", self.home / ".dsh/.credentials.yaml", database.parent / "auth.json"]:
             file.write_text("this-is-not-valid-json: secret fixture", encoding="utf-8")
+        atomic_json(self.home / "hub/state/path-aliases.json", {str(self.home / "Desktop"): str(self.home / "Projects")})
         self.catalog = Catalog(self.home / "hub", home=self.home)
 
     def write_pi(self, final=True):
@@ -109,6 +111,14 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(self.catalog.canonical(str(old)), str(self.project.resolve()))
         self.assertEqual(self.catalog.mapped_project(str(self.home), "读取 " + str(old / "README.md"), self.config)[0], "demo")
 
+    def test_relocation_aliases_are_optional_and_do_not_override_existing_folders(self):
+        old = self.home / "Desktop/demo"
+        (self.home / "hub/state/path-aliases.json").unlink()
+        unconfigured = Catalog(self.home / "hub", home=self.home)
+        self.assertEqual(unconfigured.canonical(str(old)), str(old))
+        old.mkdir(parents=True)
+        self.assertEqual(self.catalog.canonical(str(old)), str(old.resolve()))
+
     def test_archived_records_disappear_on_next_refresh(self):
         self.refresh()
         with closing(sqlite3.connect(self.home / ".codex/state_5.sqlite")) as connection, connection:
@@ -154,6 +164,43 @@ class SourceTests(unittest.TestCase):
             "record": {"identity": {"cwd": str(self.home / "hub/state/diagnostics/dsh-account"), "isSeeded": False}, "rows": {}}})
         snapshot = self.refresh()
         self.assertNotIn("session-check", {session["id"] for session in snapshot["sessions"]})
+
+    def test_restart_restores_lists_without_reading_native_sessions_or_bodies(self):
+        snapshot = self.refresh()
+        with patch.object(Catalog, "_pi", side_effect=AssertionError("must not scan during startup")):
+            restored = Catalog(self.home / "hub", home=self.home)
+        self.assertEqual({p["id"] for p in restored.snapshot()["projects"]}, {p["id"] for p in snapshot["projects"]})
+        self.assertEqual({s["id"] for s in restored.snapshot()["sessions"]}, {s["id"] for s in snapshot["sessions"]})
+        record = restored.detail(key_for("pi", "pi-session"))
+        self.assertTrue(record["cached"] and record["stale"])
+        self.assertEqual(record["state"], "unknown")
+        self.assertEqual(record["result"], "")
+        saved = json.loads(restored.snapshot_path.read_text(encoding="utf-8"))
+        self.assertTrue(all(not ({"request", "result", "preview"} & set(s)) for s in saved["sessions"]))
+        restored.refresh(self.config)
+        self.assertFalse(any(s.get("cached") for s in restored.snapshot()["sessions"]))
+        self.assertEqual(restored.detail(key_for("pi", "pi-session"))["result"], "Pi result 中文")
+
+    def test_restart_snapshot_obeys_archive_and_fresh_source_failure(self):
+        self.refresh()
+        restored = Catalog(self.home / "hub", home=self.home)
+        with closing(sqlite3.connect(self.home / ".codex/state_5.sqlite")) as connection, connection:
+            connection.execute("UPDATE threads SET archived=1 WHERE id='kept'")
+        (self.dsh / "workspace.json").write_text("partial", encoding="utf-8")
+        restored.refresh(self.config)
+        snapshot = restored.snapshot()
+        self.assertNotIn("kept", {s["id"] for s in snapshot["sessions"]})
+        self.assertTrue(next(s for s in snapshot["sessions"] if s["source"] == "dsh")["stale"])
+        self.assertFalse(snapshot["sources"]["dsh"]["ok"])
+
+    def test_invalid_or_other_user_snapshot_does_not_prevent_startup(self):
+        self.refresh()
+        data = json.loads(self.catalog.snapshot_path.read_text(encoding="utf-8"))
+        data["home"] = "another user"
+        atomic_json(self.catalog.snapshot_path, data)
+        self.assertEqual(Catalog(self.home / "hub", home=self.home).snapshot()["sessions"], [])
+        self.catalog.snapshot_path.write_text("partial", encoding="utf-8")
+        self.assertEqual(Catalog(self.home / "hub", home=self.home).snapshot()["sessions"], [])
 
 
 if __name__ == "__main__":

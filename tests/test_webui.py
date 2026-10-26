@@ -1,5 +1,7 @@
 import http.client
 import json
+import shutil
+import subprocess
 from pathlib import Path
 import sys
 import threading
@@ -15,6 +17,41 @@ import test_bridge as fixture_helpers
 
 
 class WebUITests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "Node is required for client recovery verification")
+    def test_client_reconnects_once_without_duplicate_dispatch_or_retrying_other_errors(self):
+        script = r'''
+const fs = require('node:fs'), vm = require('node:vm'), assert = require('node:assert/strict');
+const source = fs.readFileSync('web/app.js', 'utf8');
+const helper = source.slice(source.indexOf('async function api('), source.indexOf('\nfunction toast('));
+(async () => {
+  for (const scenario of ['recover', 'origin', 'repeat', 'network']) {
+    let calls = 0, dispatched = 0, pages = 0;
+    const context = {
+      DOMParser: class { parseFromString() { return {querySelector: () => ({content: 'B'.repeat(43)})}; } },
+      fetch: async (path, options) => {
+        if (path === '/') { pages++; return {ok: true, text: async () => 'fresh page'}; }
+        calls++;
+        if (scenario === 'network') throw new Error('connection lost');
+        const fresh = options.headers['X-Bridge-Token'] === 'B'.repeat(43);
+        if (fresh && scenario === 'recover') {
+          dispatched++;
+          assert.deepEqual(JSON.parse(options.body), {run: true});
+          return {ok: true, status: 200, json: async () => ({accepted: true})};
+        }
+        return {ok: false, status: 403, json: async () => ({error: scenario === 'origin' ? '请求来源不匹配。' : '页面会话已更新，请刷新页面后重试。'})};
+      }
+    };
+    vm.createContext(context);
+    vm.runInContext('let token="'+'A'.repeat(43)+'"; let tokenRefresh=null;\n'+helper, context);
+    const run = vm.runInContext('api("/api/tasks", {run: true})', context);
+    if (scenario === 'recover') { await run; assert.equal(dispatched, 1); assert.equal(calls, 2); assert.equal(pages, 1); }
+    else { await assert.rejects(run); assert.equal(dispatched, 0); assert.equal(calls, scenario === 'repeat' ? 2 : 1); assert.equal(pages, scenario === 'repeat' ? 1 : 0); }
+  }
+})().catch(error => { console.error(error); process.exitCode = 1; });
+'''
+        result = subprocess.run([shutil.which("node"), "-e", script], cwd=ROOT, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
+
     def setUp(self):
         self.fixture = fixture_helpers.BridgeTests()
         self.fixture.setUp()
@@ -99,6 +136,97 @@ class WebUITests(unittest.TestCase):
         task = self.create()
         self.assertEqual(task["status"], "queued")
         self.assertFalse((self.root / "tasks" / task["id"] / "stdout.log").exists())
+
+    def test_workflow_api_pins_new_stage_and_review_retry_preserves_executor(self):
+        status, result = self.request("/api/workflows/sample", {"primary_tool": "pi", "reviewer_tool": "codex", "primary_model": {"mode": "override", "model": "pinned-demo"}, "scope": "只改测试", "acceptance": "离线回归通过"})
+        self.assertEqual(status, 200, result)
+        status, result = self.request("/api/tasks", {"project": "sample", "prompt": "新增边界测试", "intent": "work", "title": "接续 · 重试 · 边界测试"})
+        self.assertEqual(status, 200, result)
+        parent = result["task"]
+        self.assertEqual(parent["tool"], "pi")
+        self.assertEqual(parent["model_config"]["model"], "pinned-demo")
+        parent["status"] = "succeeded"
+        self.app.bridge().save(parent)
+        status, review = self.request(f"/api/tasks/{parent['id']}/handoff", {"handoff_mode": "review", "intent": "review", "instruction": "只审查边界测试", "handoff_card": {"completed": "已新增测试", "evidence": "待核对日志"}})
+        self.assertEqual(status, 200, review)
+        task = review["task"]
+        self.assertEqual(task["tool"], "codex")
+        self.assertEqual(task["intent"], "review")
+        self.assertEqual(task["title"], "审查 · 边界测试")
+        task["status"] = "failed"
+        self.app.bridge().save(task)
+        status, retried = self.request(f"/api/tasks/{task['id']}/retry", {})
+        self.assertEqual(status, 200, retried)
+        self.assertEqual(retried["task"]["tool"], "codex")
+        self.assertEqual(retried["task"]["contract"]["executor_tool"], "pi")
+        status, continued = self.request(f"/api/tasks/{task['id']}/handoff", {"handoff_mode": "continue", "instruction": "完成剩余测试"})
+        self.assertEqual(status, 200, continued)
+        self.assertEqual(continued["task"]["tool"], "pi")
+        self.assertEqual(continued["task"]["model_config"]["model"], "pinned-demo")
+        self.assertEqual(continued["task"]["intent"], "work")
+        self.assertEqual(continued["task"]["contract"]["acceptance"], "离线回归通过")
+        self.assertTrue(self.request("/api/bootstrap")[1]["workflows"]["sample"])
+        self.assertTrue(self.request(f"/api/tasks/{task['id']}")[1]["handoff_card"])
+
+    def test_workflow_and_card_api_reject_invalid_authorization_fields_without_new_tasks(self):
+        self.assertEqual(self.request("/api/workflows/sample", {"primary_tool": "pi", "api_key": "forbidden"})[0], 400)
+        parent = self.create()
+        parent["status"] = "succeeded"
+        self.app.bridge().save(parent)
+        before = len(list((self.root / "tasks").glob("*/task.json")))
+        status, result = self.request(f"/api/tasks/{parent['id']}/handoff", {"instruction": "继续", "handoff_mode": "continue", "handoff_card": {"scope": "扩大权限"}})
+        self.assertEqual(status, 400, result)
+        self.assertEqual(len(list((self.root / "tasks").glob("*/task.json"))), before)
+
+    def test_saved_tasks_and_cached_sessions_remain_visible_during_slow_sync(self):
+        task = self.create()
+        record = {"id": "cold-session", "key": "pi-cold", "source": "pi", "project": "sample",
+                  "title": "saved session", "state": "unknown", "cached": True, "stale": True}
+        self.app.catalog.sessions[record["key"]] = record
+        entered, release = threading.Event(), threading.Event()
+        def slow_refresh(config):
+            entered.set()
+            release.wait(4)
+        with patch.object(self.app.catalog, "refresh", slow_refresh):
+            try:
+                self.app.refresh_sources()
+                self.assertTrue(entered.wait(1))
+                status, data = self.request("/api/bootstrap")
+                self.assertEqual(status, 200)
+                self.assertTrue(data["syncing"])
+                self.assertTrue(data["sources_cached"])
+                self.assertIn(task["id"], {t["id"] for t in data["tasks"]})
+                self.assertIn(record["key"], {s["key"] for s in data["sessions"]})
+                status, result = self.request("/api/sessions/pi-cold/handoff", {"instruction": "continue", "tool": "pi", "run": False})
+                self.assertEqual(status, 400)
+                self.assertIn("正文", result["error"])
+            finally:
+                release.set()
+        self.assertFalse((self.root / "tasks" / task["id"] / "stdout.log").exists())
+
+    def test_fast_codex_probe_is_published_while_other_tools_are_still_checking(self):
+        release, slow_started = threading.Event(), threading.Event()
+        def engine(name):
+            if name != "codex":
+                slow_started.set()
+                release.wait(4)
+            return self.fixture.engine(name)
+        try:
+            with patch.object(webui, "detect_engine", engine):
+                self.app.refresh_tools()
+                self.assertTrue(slow_started.wait(1))
+                deadline = time.monotonic() + 2
+                while self.app.tools["codex"].get("checking") and time.monotonic() < deadline:
+                    time.sleep(.02)
+                self.assertTrue(self.app.tools["codex"]["available"])
+                self.assertFalse(self.app.tools["codex"]["checking"])
+                self.assertTrue(self.app.checking)
+                self.assertTrue(self.app.tools["pi"]["checking"])
+        finally:
+            release.set()
+            deadline = time.monotonic() + 3
+            while self.app.checking and time.monotonic() < deadline:
+                time.sleep(.02)
 
     def test_create_and_execute_returns_result_and_download(self):
         task = self.create(run=True)

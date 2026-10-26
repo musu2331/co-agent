@@ -18,3 +18,17 @@ RELEASE-MANIFEST.json
 .env
 .env.*
 !.env.example
+*.log
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.pem
+*.key
+*.p12
+*.pfx
+/.credentials.yaml
+/auth.json
+/screenshots/
+/*.jpg
+/*.jpeg

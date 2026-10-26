@@ -14,12 +14,12 @@ co-agent 为 Codex、Pi、DeepSeek Harness 提供一个本机 WebUI：共用原�
 
 - 主要验收平台：Windows，Python **3.12 或更新版本**。安装时启用 Python Launcher 或将 Python 加入 PATH。项目没有 pip 依赖。
 - 根据需要安装 Codex CLI、Pi 与 DeepSeek Harness，并在各自原工具中完成登录。可只装其中一款，未安装的工具会显示不可用。
-- Codex：使用 PATH 中的 `codex.exe`；也支持常见 npm 全局安装位置的 Node 启动入口。
+- Codex：识别有效的 `CODEX_CLI_PATH`、PATH、常见用户安装目录及桌面应用的版本目录；也支持常见 npm 全局安装位置的 Node 启动入口。
 - Pi：优先识别 `~/.pi/agent/bin/pi-launcher.js`，也支持常见 npm 全局安装位置的 `@mariozechner/pi-coding-agent/dist/cli.js`，需要 Node.js。
 - Windows DSH：识别 `%LOCALAPPDATA%/Programs/DeepSeek Harness/DeepSeek Harness.exe` 和随应用提供的 CLI。安装在其他目录时，需要调整 `bridge.py` 中的 `detect_engine()`。
 - Linux / WSL 保留 PATH 中 `codex`、`pi`、`dsh` 入口适配，但未进行本次 Windows 之外的完整验收。运行依赖应在各系统单独安装。
 
-本次适配依据的本机 CLI 版本是 Codex `0.163.0-alpha.11.2`、Pi `1.2.0`、DSH `0.2.1-rc.2`。不同版本应先核对原工具的 `--help`，尤其是 DSH profile 与包内 CLI 入口。
+不同 CLI 版本的参数和安装布局可能变化。部署时应读取原工具的 `--version` 与 `--help`，尤其核对 DSH profile 与包内 CLI 入口；仓库不保存部署者的实际安装版本。
 
 ## 3. 首次打开
 
@@ -128,6 +128,14 @@ python -B export_release.py --output ../my-clean-release
 如果通过 Git 分享纯源码，运行配置会被 `.gitignore` 排除；接收者可先运行导出命令生成一个带空配置的运行目录，再从该目录启动。
 
 ## 8. 常见问题
+
+若项目目录曾迁移，可在本机 `state/path-aliases.json` 中配置“旧绝对目录 → 新绝对目录”的 JSON 映射；仅在原目录不存在、目标目录存在时应用。该可选文件不随源码或模板分享，未配置时不猜测个人目录布局。
+
+项目页新增“协作流程设置”：固定主执行工具和可选的具体模型，保存统一验收标准与授权范围；转交默认继续同一阶段，关键节点才手动审查。交接卡区分模型陈述和证据，支持明确的阻塞分类。新阶段使用新的默认值，已有阶段沿用快照。操作与边界见 [WORKFLOW.md](WORKFLOW.md)。
+
+Windows 上的 Codex 定位兼容桌面启动时的旧 PATH：依次检查有效的 `CODEX_CLI_PATH`、PATH、用户独立安装目录、桌面应用版本目录和 npm 安装。版本目录每次重新定位，避免更新后绑定已删除的旧文件；三个工具的版本检测分别完成、分别显示，不等待最慢的工具。这里只验证命令能启动，不代表模型账号或额度已验证。服务重启造成页面令牌更新时，前端自动重新连接并保留未提交的表单；仅对令牌校验明确拒绝、尚未执行的请求重试一次，不重试网络错误或其他权限拒绝。
+
+启动时先从 `state/source-snapshot.json` 恢复上次项目和会话列表，再在后台核对原工具；不等待工具版本检测。快照只保存列表元数据，不复制会话正文或账号凭据，也不会随无数据模板导出。核对前的原工具状态显示为“已保存”，正文与上下文转交等待来源同步完成；本台任务仍直接读取自己的任务文件。首次启用来源同步时没有快照，需要扫描一次。
 
 - 工具“命令可启动”但执行失败：到原工具检查登录、额度、模型权限和审批。界面保留实际失败日志，不把版本探测当成模型验证。
 - DSH 返回账号未登录：先在 DSH 官方应用登录；不要从别人机器复制 `.credentials.yaml` 或令牌。自己的安装版本不支持该 profile 时，需要按其官方文档更新适配。

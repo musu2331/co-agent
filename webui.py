@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -23,6 +23,7 @@ from sources import Catalog
 from maintenance import Maintenance
 from model_config import ModelProfiles, describe as describe_model
 from setup_workspace import initialize_hub
+from workflow import preferences, save_preferences, card as report_card, edit_card, clean_title, BLOCKERS
 
 SERVICE = "agent-bridge-webui"
 ROOT = Path(__file__).resolve().parent
@@ -250,7 +251,9 @@ class App:
             return {"projects": projects, "tasks": tasks, "tools": self.tool_states(self.task_list()),
                     "sessions": catalog["sessions"], "sources": catalog["sources"], "synced_at": catalog["updated_at"], "syncing": self.syncing,
                     "hub": str(self.root), "server_time": now(), "checking": self.checking,
-                    "model_profiles": ModelProfiles(self.root).read(), "auto_sync_sources": self.auto_sync_sources}
+                    "sources_cached": any(s.get("cached") for s in catalog["sessions"]),
+                    "model_profiles": ModelProfiles(self.root).read(), "auto_sync_sources": self.auto_sync_sources,
+                    "workflows": preferences(self.root), "blocker_categories": BLOCKERS}
 
     def source_settings(self, enabled):
         if not isinstance(enabled, bool):
@@ -277,13 +280,16 @@ class App:
             task["stopping"] = task["managed"] and self.jobs[task_id].cancel.is_set()
             if task["status"] == "queued" and task["managed"]:
                 task["status"] = "starting"
+            stage = bridge.stage(task, request_text(source))
             return {"task": self.decorate(task), "request": request_text(source),
+                    "handoff_stage": stage,
+                    "handoff_card": report_card({**task, "contract": stage}, request_text(source), text_file(folder / ("external-result.md" if task.get("resolution") else "result.md"))),
                     "result": text_file(folder / "result.md"),
                     "external_result": text_file(folder / "external-result.md"),
                     "stdout": text_file(folder / "stdout.log", 64000, True),
                     "stderr": text_file(folder / "stderr.log", 64000, True)}
 
-    def create(self, body):
+    def create(self, body, *, handoff_input=None, handoff_mode=None):
         if "run" in body and not isinstance(body["run"], bool):
             raise BridgeError("执行选项格式不正确。")
         prompt = body.get("prompt", "")
@@ -299,9 +305,11 @@ class App:
             if body.get("project", "") in self.maintenance.hidden_ids():
                 raise BridgeError("这个项目已标记废弃，请先在后台维护中恢复显示。")
             project_key = self.ensure_project(body.get("project", ""))
-            task = self.bridge().create(project_key, body.get("tool", ""), prompt,
+            chosen_tool = body.get("tool") or preferences(self.root).get(project_key, {}).get("primary_tool") or "codex"
+            task = self.bridge().create(project_key, chosen_tool, prompt,
                                         title=title, intent=body.get("intent", "review"),
-                                        origin="webui", refs=refs, model_config=body.get("model_config"))
+                                        origin="webui", refs=refs, model_config=body.get("model_config"),
+                                        handoff_input=handoff_input, handoff_mode=handoff_mode)
             if body.get("run"):
                 try:
                     self.start(task["id"])
@@ -379,8 +387,11 @@ class App:
                 raise BridgeError("请填写转交说明。")
             child = bridge.handoff(task_id, parent["tool"] if retry else body.get("tool", ""),
                                    instruction, body.get("intent"),
-                                   model_config=parent.get("model_config", {"mode": "inherit"}) if retry else body.get("model_config"))
-            child["title"] = ("重试 · " if retry else "接续 · ") + title_for(parent, text_file(bridge.folder(task_id) / "TASK.md"))[:100]
+                                   model_config=parent.get("model_config", {"mode": "inherit"}) if retry else body.get("model_config"),
+                                   mode=parent.get("handoff_mode", "switch") if retry else body.get("handoff_mode"),
+                                   handoff_card=None if retry else body.get("handoff_card"))
+            prefix = "重试" if retry else "审查" if child.get("handoff_mode") == "review" else "接续"
+            child["title"] = prefix + " · " + clean_title(title_for(parent, text_file(bridge.folder(task_id) / "TASK.md")))
             if retry:
                 child["retry_of"] = task_id
             bridge.save(child)
@@ -400,6 +411,8 @@ class App:
             bridge = self.bridge()
             target = bridge.load(task_id)
             external = self.catalog.evidence(key, target.get("refs", []))
+            if external.get("cached"):
+                raise BridgeError("来源正文尚未恢复，请等待后台同步完成后再关联结果。")
             related = [target]
             if body.get("related", False):
                 tasks = [bridge.load(t["id"]) for t in self.task_list()]
@@ -428,6 +441,13 @@ class App:
 
     def session_handoff(self, key, body):
         source = self.catalog.detail(key)
+        if source.get("cached"):
+            raise BridgeError("来源正文尚未恢复，请等待后台同步完成后再转交。")
+        mode = body.get("handoff_mode", "switch")
+        if mode not in {"continue", "review", "switch"}:
+            raise BridgeError("转交方式无效。")
+        if mode == "review" and body.get("intent", "review") != "review":
+            raise BridgeError("关键节点审查只允许审阅模式。")
         if body.get("run") and (source.get("stale") or source.get("state") == "turn_open"):
             raise BridgeError("原会话轮次尚未结束或来源未能更新。可以先转交待办，核对原工具后再执行。")
         instruction = body.get("instruction", "")
@@ -438,14 +458,24 @@ class App:
                    f"来源：{source['source']} · {source['title']}\n原会话 ID：{source['id']}\n"
                    f"原始目录：{source.get('cwd', '')}\n\n### 最近的要求\n{source.get('request', '')[:18000]}\n\n"
                    f"### 最近保存的答复\n{source.get('result', '')[-60000:]}")
+        summary = edit_card(report_card({"tool": source["source"], "status": "succeeded"}, source.get("request", ""), source.get("result", "")), body.get("handoff_card"))
         return self.create({"project": project, "tool": body.get("tool"), "prompt": context,
                             "title": "接续 · " + source["title"][:100], "intent": body.get("intent", "review"),
-                            "model_config": body.get("model_config"), "run": body.get("run", False)})
+                            "model_config": body.get("model_config"), "run": body.get("run", False)},
+                           handoff_input=summary, handoff_mode=mode)
 
     def save_model(self, tool, selection):
         with self.guard:
             profiles = ModelProfiles(self.root).save(tool, selection)
         return {"profiles": profiles, "saved": True}
+
+    def save_workflow(self, project, body):
+        with self.guard:
+            project = self.ensure_project(project)
+            primary = body.get("primary_tool")
+            if primary:
+                ModelProfiles(self.root).select(primary, body.get("primary_model"))
+            return {"project": project, "workflow": save_preferences(self.root, project, body)}
 
     def acknowledge_tool(self, tool):
         if tool not in TOOLS:
@@ -509,6 +539,7 @@ class App:
             if self.checking:
                 return {"checking": True}
             self.checking = True
+            self.tools = {name: {**state, "checking": True} for name, state in self.tools.items()}
         def probe_one(name):
             try:
                 engine = detect_engine(name)
@@ -518,16 +549,21 @@ class App:
                 process = subprocess.run([*engine.command, "--version"], cwd=self.root, env=environment,
                                          capture_output=True, timeout=20, shell=False, **options)
                 return name, {"available": process.returncode == 0, "checking": False,
+                              "executable": engine.command[0],
                               "version": process.stdout.decode("utf-8", errors="replace").strip()[:200],
                               "error": process.stderr.decode("utf-8", errors="replace")[-1500:] if process.returncode else ""}
             except Exception as exc:
                 return name, {"available": False, "checking": False, "version": "", "error": str(exc)}
         def finish():
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                result = dict(executor.map(probe_one, TOOLS))
-            with self.guard:
-                self.tools = result
-                self.checking = False
+            try:
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    for future in as_completed([executor.submit(probe_one, name) for name in TOOLS]):
+                        name, result = future.result()
+                        with self.guard:
+                            self.tools[name] = result
+            finally:
+                with self.guard:
+                    self.checking = False
         threading.Thread(target=finish, name="bridge-doctor", daemon=True).start()
         return {"checking": True}
 
@@ -685,6 +721,11 @@ class Handler(BaseHTTPRequestHandler):
                 result = app.session_handoff(checked_id(pieces[2]), body)
             elif path == "/api/projects":
                 result = app.save_project(body)
+            elif path.startswith("/api/workflows/"):
+                pieces = path.strip("/").split("/")
+                if len(pieces) != 3:
+                    raise BridgeError("协作配置请求格式不正确。")
+                result = app.save_workflow(checked_id(pieces[2]), body)
             elif path.startswith("/api/projects/") and path.endswith("/open"):
                 pieces = path.strip("/").split("/")
                 if len(pieces) != 4:

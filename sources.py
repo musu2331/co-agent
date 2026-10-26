@@ -16,7 +16,7 @@ from pathlib import Path
 import sqlite3
 import threading
 
-from bridge import BridgeError, now, read_json
+from bridge import BridgeError, atomic_json, now, read_json
 
 
 def key_for(source, identity):
@@ -52,12 +52,54 @@ class Catalog:
         self.root = Path(root)
         self.home = Path(home) if home else Path.home()
         self.guard = threading.RLock()
+        self.path_aliases = {}
+        try:
+            aliases = read_json(self.root / "state/path-aliases.json")
+            if isinstance(aliases, dict):
+                self.path_aliases = {old: new for old, new in aliases.items()
+                                     if isinstance(old, str) and isinstance(new, str)
+                                     and Path(old).is_absolute() and Path(new).is_absolute()}
+        except (OSError, ValueError, TypeError):
+            pass
         self.cache = {}
         self.boundaries = {}
         self.projects = []
         self.sessions = {}
         self.health = {}
         self.updated_at = ""
+        self.snapshot_path = self.root / "state/source-snapshot.json"
+        self._restore_snapshot()
+
+    def _restore_snapshot(self):
+        """Restore list metadata only; native sources remain authoritative."""
+        try:
+            data = read_json(self.snapshot_path)
+            if data.get("version") != 1 or data.get("home") != str(self.home.resolve()):
+                return
+            projects, records, health = data["projects"], data["sessions"], data["sources"]
+            if not isinstance(projects, list) or not isinstance(records, list) or not isinstance(health, dict):
+                return
+            sessions = {}
+            for record in records:
+                if record["source"] not in {"pi", "codex", "dsh"} or record["key"] != key_for(record["source"], record["id"]):
+                    return
+                sessions[record["key"]] = {**record, "cached": True, "stale": True, "state": "unknown",
+                                          "request": "", "result": "", "state_note": "启动快照，正在后台核对来源"}
+            self.projects, self.sessions = projects, sessions
+            self.health = {name: {**info, "cached": True} for name, info in health.items()}
+            self.updated_at = data["updated_at"]
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            pass  # A missing or damaged snapshot must never prevent startup.
+
+    def _save_snapshot(self):
+        data = self.snapshot()
+        # Do not duplicate conversation bodies or credentials into startup state.
+        data["sessions"] = [{k: v for k, v in record.items() if k not in {"preview", "cached"}} for record in data["sessions"]]
+        data.update(version=1, home=str(self.home.resolve()))
+        try:
+            atomic_json(self.snapshot_path, data)
+        except OSError:
+            pass  # A read-only/full disk still permits live synchronization.
 
     def _cached(self, path, parser):
         stat = path.stat()
@@ -71,7 +113,7 @@ class Catalog:
         return dict(entry[1]) if entry[1] else None
 
     def canonical(self, raw):
-        """Resolve existing folders; support the user's Desktop -> DeskBox move."""
+        """Resolve existing folders and optional runtime-only relocation aliases."""
         if not raw:
             return ""
         if raw.startswith("\\\\?\\"):
@@ -79,13 +121,15 @@ class Catalog:
         path = Path(raw).expanduser()
         if path.is_dir():
             return str(path.resolve())
-        desktop = self.home / "Desktop"
-        try:
-            relative = path.relative_to(desktop)
-        except ValueError:
-            return str(path)
-        moved = self.home / "DeskBox/workspace" / relative
-        return str(moved.resolve()) if moved.is_dir() else str(path)
+        for old, new in self.path_aliases.items():
+            try:
+                relative = path.relative_to(Path(old))
+            except ValueError:
+                continue
+            moved = Path(new) / relative
+            if moved.is_dir():
+                return str(moved.resolve())
+        return str(path)
 
     def mapped_project(self, cwd, context, config):
         canonical = self.canonical(cwd)
@@ -99,10 +143,11 @@ class Catalog:
                 # A Pi conversation can keep its initial home cwd after work moves.
                 # Only associate explicitly mentioned registered paths, never a basename.
                 aliases = [raw]
-                try:
-                    aliases.append(str(self.home / "Desktop" / Path(raw).relative_to(self.home / "DeskBox/workspace")))
-                except ValueError:
-                    pass
+                for old, new in self.path_aliases.items():
+                    try:
+                        aliases.append(str(Path(old) / Path(raw).relative_to(Path(new))))
+                    except ValueError:
+                        pass
                 if any(p.casefold() in context.casefold() for p in aliases):
                     matches.append((len(normalized), identity, normalized))
         if matches:
@@ -155,6 +200,7 @@ class Catalog:
             group["mapped_project"] = self.mapped_project(group.get("native_path", ""), "", config)[0]
         with self.guard:
             self.projects, self.sessions, self.health, self.updated_at = list(projects.values()), sessions, health, now()
+        self._save_snapshot()
 
     def snapshot(self):
         with self.guard:
